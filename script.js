@@ -26,73 +26,151 @@ document.addEventListener("DOMContentLoaded", () => {
     return h * 60 + m;
   }
 
-  // Parse les horaires d'une agence et renvoie {status, next}
-  function parseHoraires(horaires) {
-    const jours = ["DI", "LU", "MA", "ME", "JE", "VE", "SA"];
-    const now = new Date();
+  // Convertit le tableau horaires ES → lignes "LU : 07:45-15:30[/12:30-17:00]"
+  function horairesArrayToLines(horaires = []) {
+    const order = ["LU", "MA", "ME", "JE", "VE", "SA", "DI"];
+    const label = { LU: "LU", MA: "MA", ME: "ME", JE: "JE", VE: "VE", SA: "SA", DI: "DI" };
 
-    // Jour actuel (ex: "LU", "MA", ...)
-    const weekdayShort = new Intl.DateTimeFormat("fr-FR", {
-      timeZone: "Pacific/Noumea",
-      weekday: "short",
-    })
-      .format(now) // ex. "lun."
-      .replace(".", "")
-      .toUpperCase()
-      .slice(0, 2);
-    const jourActuel = jours.includes(weekdayShort) ? weekdayShort : jours[now.getDay()];
-
-    const currentMin = minutesNowNC();
-
-    // Lignes d'horaires (séparées par <br>)
-    const lines = (horaires || "").split("<br>");
-    // Récupère la ligne du jour courant: "LU : 07:45-12:00/12:00-15:30" ou "LU : Fermé"
-    const line = lines.find((l) => l.startsWith(jourActuel)) || "";
-
-    // Normalise pour gérer "Fermé"/"Ferme"
-    const lineNorm = line.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-    if (/ferme/i.test(lineNorm)) return { status: "Fermé", next: "Ouvre demain" };
-
-    // Extrait toutes les plages HH:MM-HH:MM
-    const matches = [...line.matchAll(/\b(\d{2}):(\d{2})-(\d{2}):(\d{2})\b/g)];
-    if (matches.length === 0) return { status: "Fermé", next: "Horaire indisponible" };
-
-    // Convertit en minutes et fusionne les plages contiguës/chevauchantes
-    let ranges = matches
-      .map((m) => [+m[1] * 60 + +m[2], +m[3] * 60 + +m[4]])
-      .sort((a, b) => a[0] - b[0]);
-
-    const merged = [];
-    for (const [s, e] of ranges) {
-      if (!merged.length || s > merged[merged.length - 1][1]) {
-        merged.push([s, e]);
-      } else {
-        merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], e);
-      }
+    // Map rapide par code jour
+    const byJour = Object.fromEntries(order.map(j => [j, null]));
+    for (const h of horaires) {
+      if (byJour.hasOwnProperty(h.jour)) byJour[h.jour] = h;
     }
 
-    // Ouvert maintenant ?
-    for (const [start, end] of merged) {
-      if (currentMin >= start && currentMin < end) {
-        return {
-          status: "Ouvert",
-          next: `Ferme à ${String(Math.floor(end / 60)).padStart(2, "0")}h${String(end % 60).padStart(2, "0")}`,
-        };
+    // Formate une journée
+    function formatJour(h) {
+      if (!h) return "Fermé";
+      const { horaireAm1, horaireAm2, horairePm1, horairePm2 } = h;
+      const hasAm = horaireAm1 && horaireAm2;
+      const hasPm = horairePm1 && horairePm2;
+
+      // Cas le plus fréquent : sans coupure (Am1 → Pm2)
+      if (horaireAm1 && horairePm2 && !horaireAm2 && !horairePm1) {
+        return `${horaireAm1}-${horairePm2}`;
       }
+      // Matin + après-midi
+      if (hasAm && hasPm) {
+        return `${horaireAm1}-${horaireAm2}/${horairePm1}-${horairePm2}`;
+      }
+      // Un seul créneau
+      if (hasAm) return `${horaireAm1}-${horaireAm2}`;
+      if (hasPm) return `${horairePm1}-${horairePm2}`;
+
+      return "Fermé";
     }
 
-    // Prochaine ouverture aujourd'hui ?
-    const nextRange = merged.find(([start]) => currentMin < start);
-    if (nextRange) {
-      const [start] = nextRange;
+    return order.map(j => `${label[j]} : ${formatJour(byJour[j])}`).join("<br>");
+  }
+
+// Parse les horaires (au format lignes "XX : hh:mm-hh:mm[/…]") et renvoie {status, next}
+function parseHoraires(horaires) {
+  const jours = ["DI", "LU", "MA", "ME", "JE", "VE", "SA"];
+  const now = new Date();
+
+  // Jour actuel (ex: "LU", "MA", ...)
+  const weekdayShort = new Intl.DateTimeFormat("fr-FR", {
+    timeZone: "Pacific/Noumea",
+    weekday: "short",
+  })
+    .format(now) // ex. "lun."
+    .replace(".", "")
+    .toUpperCase()
+    .slice(0, 2);
+  const jourActuel = jours.includes(weekdayShort) ? weekdayShort : jours[now.getDay()];
+
+  const currentMin = minutesNowNC();
+
+  // Lignes d'horaires (séparées par <br>)
+  const lines = (horaires || "").split("<br>");
+  // Ligne du jour courant
+  const line = lines.find((l) => l.startsWith(jourActuel)) || "";
+  const lineNorm = line.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
+  // Cas : agence fermée aujourd’hui
+  if (/ferme/i.test(lineNorm)) {
+    // chercher le prochain jour ouvert
+    const idxJour = jours.indexOf(jourActuel);
+    for (let i = 1; i <= 6; i++) {
+      const prochainJour = jours[(idxJour + i) % 7];
+      const prochainLine = lines.find((l) => l.startsWith(prochainJour)) || "";
+      const prochainNorm = prochainLine.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+      if (!/ferme/i.test(prochainNorm) && /\d{2}:\d{2}-\d{2}:\d{2}/.test(prochainNorm)) {
+        return { status: "Fermé", next: `Ouvre ${prochainJour}` };
+      }
+    }
+    return { status: "Fermé", next: "Horaires indisponibles" };
+  }
+
+  // Extrait toutes les plages HH:MM-HH:MM
+  const matches = [...line.matchAll(/\b(\d{2}):(\d{2})-(\d{2}):(\d{2})\b/g)];
+  if (matches.length === 0) return { status: "Fermé", next: "Horaire indisponible" };
+
+  // Convertit en minutes et fusionne les plages contiguës/chevauchantes
+  let ranges = matches
+    .map((m) => [+m[1] * 60 + +m[2], +m[3] * 60 + +m[4]])
+    .sort((a, b) => a[0] - b[0]);
+
+  const merged = [];
+  for (const [s, e] of ranges) {
+    if (!merged.length || s > merged[merged.length - 1][1]) {
+      merged.push([s, e]);
+    } else {
+      merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], e);
+    }
+  }
+
+  // Ouvert maintenant ?
+  for (const [start, end] of merged) {
+    if (currentMin >= start && currentMin < end) {
       return {
-        status: "Fermé",
-        next: `Ouvre à ${String(Math.floor(start / 60)).padStart(2, "0")}h${String(start % 60).padStart(2, "0")}`,
+        status: "Ouvert",
+        next: `Ferme à ${String(Math.floor(end / 60)).padStart(2, "0")}h${String(end % 60).padStart(2, "0")}`,
       };
     }
+  }
 
-    // Sinon, ce sera demain
-    return { status: "Fermé", next: "Ouvre demain" };
+  // Prochaine ouverture aujourd’hui ?
+  const nextRange = merged.find(([start]) => currentMin < start);
+  if (nextRange) {
+    const [start] = nextRange;
+    return {
+      status: "Fermé",
+      next: `Ouvre à ${String(Math.floor(start / 60)).padStart(2, "0")}h${String(start % 60).padStart(2, "0")}`,
+    };
+  }
+
+  // Sinon, chercher le prochain jour
+  const idxJour = jours.indexOf(jourActuel);
+  for (let i = 1; i <= 6; i++) {
+    const prochainJour = jours[(idxJour + i) % 7];
+    const prochainLine = lines.find((l) => l.startsWith(prochainJour)) || "";
+    const prochainNorm = prochainLine.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    if (!/ferme/i.test(prochainNorm) && /\d{2}:\d{2}-\d{2}:\d{2}/.test(prochainNorm)) {
+      return { status: "Fermé", next: `Ouvre ${prochainJour}` };
+    }
+  }
+
+  return { status: "Fermé", next: "Horaires indisponibles" };
+}
+
+
+  // Sélectionne le téléphone principal depuis contacts[]
+  function pickPhone(contacts = []) {
+    const tels = contacts.filter(c => c.typeContact === "TELEPHONE");
+    // Priorité aux libellés d'accueil/AMS, sinon le premier
+    return (
+      tels.find(t => /AMS|ACCUEIL|STANDARD/i.test(t.description || ""))?.valeur ||
+      tels[0]?.valeur ||
+      ""
+    );
+  }
+
+  function pickFax(contacts = []) {
+    return contacts.find(c => c.typeContact === "FAX")?.valeur || "";
+  }
+
+  function pickEmail(contacts = []) {
+    return contacts.find(c => c.typeContact === "EMAIL")?.valeur || "";
   }
 
   // --- Données + UI ---
@@ -100,34 +178,48 @@ document.addEventListener("DOMContentLoaded", () => {
   const listings = document.getElementById("listings");
   const searchInput = document.getElementById("search");
 
-  fetch(
-    "https://services6.arcgis.com/k3ZIRnRpeM4Ht4fG/arcgis/rest/services/Agences_opendata/FeatureServer/0/query?outFields=*&where=1%3D1&f=geojson"
-  )
-    .then((response) => response.json())
-    .then((data) => {
-      data.features.forEach((feature) => {
-        const agence = {
-          lat: feature.geometry.coordinates[1],
-          lng: feature.geometry.coordinates[0],
-          nom: feature.properties.TEXTE,
-          adresse: feature.properties.ADRESSE,
-          codePostal: feature.properties.CODE_POSTAL,
-          ville: feature.properties.VILLE,
-          telephone: feature.properties.TEL,
-          fax: feature.properties.FAX,
-          // On garde le <br> pour le parsing + affichage
-          horaires: (feature.properties.HORAIRE || "").replace(/\n/g, "<br>"),
-        };
+  // ⚠️ CORS: l’API open-data accepte les GET; on utilise la syntaxe q= et size=
+  const ES_URL =
+  "https://open-data.opt.nc/agences/_search?q=(type:AGENCE%20OR%20type:ANNEXE%20OR%20type:CTC%20OR%20type:CDC)%20AND%20NOT%20hiddenOptNc:true&size=1000";
 
-        // Statut en fonction des horaires (heure NC)
-        const { status, next } = parseHoraires(agence.horaires);
+// const ES_URL ="https://open-data.opt.nc/agences/_search?q=*:*&size=1000";
+
+  fetch(ES_URL)
+  .then((r) => r.json())
+  .then((json) => {
+    const hits = (json.hits && json.hits.hits) || [];
+    
+    hits.forEach((hit) => {
+      const s = hit._source || {};
+      if (!["AGENCE", "ANNEXE", "CTC", "CDC"].includes(s.type) || s.hiddenOptNc === true) return;
+
+      console.log("Type:", s.type, "Designation:", s.designation);
+        // Coordonnées
+        const lat = s.position?.lat;
+        const lng = s.position?.lon;
+        if (typeof lat !== "number" || typeof lng !== "number") return;
+
+        // Nom / adresse / ville
+        const nom = s.designation || ""; // ex: "Agence de LIFOU WE"
+        const adresse = s.pointAdresse || "";
+        const codePostal = s.codePostal || s.codePostalRefloc || "";
+        const ville = s.localiteRefloc || s.localite || "";
+
+        // Contacts
+        const telephone = pickPhone(s.contacts);
+        const fax = pickFax(s.contacts);
+        const email = pickEmail(s.contacts);
+
+        // Horaires -> lignes "<br>" pour réutiliser ta logique existante
+        const horairesLignes = horairesArrayToLines(s.horaires || []);
+        const { status, next } = parseHoraires(horairesLignes);
         const statusColor = status === "Ouvert" ? "green" : "rgb(248, 59, 59)";
 
         // Tableau d’horaires formaté
         const horairesFormattes =
           `<table style="width:100%; border-collapse: collapse;">` +
           `<tr><th style="text-align:left;border:1px solid #ccc;padding:5px;">Jour</th><th style="text-align:left;border:1px solid #ccc;padding:5px;">Horaires</th></tr>` +
-          agence.horaires
+          horairesLignes
             .split("<br>")
             .map((line) => {
               const [jour, heures] = line.split(" : ");
@@ -139,28 +231,45 @@ document.addEventListener("DOMContentLoaded", () => {
             .join("") +
           `</table>`;
 
-        // Marqueur + popup
-        const marker = L.marker([agence.lat, agence.lng]).addTo(mymap).bindPopup(`
-          <div>
-            <h2 style="margin-bottom: 5px;">Agence de ${agence.nom}</h2>
-            <p>
-              <b>Adresse :</b> ${agence.adresse}<br>
-              <b>Code Postal :</b> ${agence.codePostal} - ${agence.ville}<br>
-              <b>Téléphone :</b> ${agence.telephone || "-"}<br>
-              <b>Fax :</b> ${agence.fax || "-"}
-            </p>
-            ${horairesFormattes}
-            <p><b>Status :</b> <span style="color:${statusColor};">${status}</span></p>
-            <p><b>Prochainement :</b> ${next}</p>
-          </div>
-        `);
+        const marker = L.marker([lat, lng])
+          .addTo(mymap)
+          .bindPopup(`
+            <div>
+              <h2 style="margin-bottom: 5px;">${nom}</h2>
+              <p>
+                <b>Adresse :</b> ${adresse}<br>
+                <b>Code Postal :</b> ${codePostal} - ${ville}<br>
+                <b>Téléphone :</b> ${telephone || "-"}<br>
+                <b>Fax :</b> ${fax || "-"}<br>
+                <b>Email :</b> ${email || "-"}<br>
+                <b>Accessibilité :</b> ${s.accesHandicapes ? "♿ Oui" : "Non"}
+              </p>
+              ${horairesFormattes}
+              <p><b>Status :</b> <span style="color:${statusColor};">${status}</span></p>
+              <p><b>Prochainement :</b> ${next}</p>
+            </div>
+          `);
 
-        agences.push({ ...agence, marker, status, next });
+        agences.push({
+          lat,
+          lng,
+          nom,
+          adresse,
+          codePostal,
+          ville,
+          telephone,
+          fax,
+          email,
+          horaires: horairesLignes, // on garde le même nom de champ pour ta recherche/affichage
+          marker,
+          status,
+          next,
+        });
       });
 
       updateListings();
     })
-    .catch((error) => console.error("Erreur lors du chargement des agences :", error));
+    .catch((error) => console.error("Erreur lors du chargement des agences (ES):", error));
 
   // MAJ de la liste affichée (filtre recherche)
   function updateListings() {
@@ -189,7 +298,7 @@ document.addEventListener("DOMContentLoaded", () => {
           </div>
         `;
         item.addEventListener("click", () => {
-          mymap.setView([agence.lat, agence.lng], 20);
+          mymap.setView([agence.lat, agence.lng], 19);
           agence.marker.openPopup();
         });
         listings.appendChild(item);
